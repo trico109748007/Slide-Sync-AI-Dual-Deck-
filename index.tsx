@@ -178,7 +178,7 @@ const App = () => {
 
         let currentTime = 0;
         
-        // Optimization: Reduced max width to 128 (Thumbnail size) to handle 1500 frames
+        // Optimization: Reduced max width to 256
         const scale = Math.min(1.0, 256 / video.videoWidth);
         canvas.width = video.videoWidth * scale;
         canvas.height = video.videoHeight * scale;
