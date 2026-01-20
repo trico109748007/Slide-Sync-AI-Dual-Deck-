@@ -77,7 +77,7 @@ const App = () => {
       setPdfImages(allPdfImages);
       
       // 3. Process Video
-      setStatus({ step: 'extracting_video', message: 'Smart sampling video frames...', progress: 25 });
+      setStatus({ step: 'extracting_video', message: 'Smart sampling video frames (High Density)...', progress: 25 });
       
       // We no longer pass a fixed interval. The function calculates it based on video length
       // to ensure we don't exceed token limits.
@@ -153,10 +153,9 @@ const App = () => {
         }
 
         // --- Dynamic Interval Calculation ---
-        // Constraint: Avoid hitting 1M token limit.
-        // Target: ~250 frames max. 
-        // Logic: interval = duration / 250, but never less than 2 seconds to avoid redundancy in short videos.
-        const TARGET_FRAME_COUNT = 250; 
+        // Optimization: Increased target count to 500 for better accuracy
+        // while reducing image resolution and quality to keep payload small.
+        const TARGET_FRAME_COUNT = 500; 
         const MIN_INTERVAL = 2; // seconds
         
         let interval = duration / TARGET_FRAME_COUNT;
@@ -164,9 +163,8 @@ const App = () => {
 
         let currentTime = 0;
         
-        // Use a smaller size for video frames to allow more frames in context window
-        // Max width 512px, Quality 0.6
-        const scale = Math.min(1.0, 512 / video.videoWidth);
+        // Optimization: Reduced max width from 512 to 400 to save tokens/bandwidth
+        const scale = Math.min(1.0, 400 / video.videoWidth);
         canvas.width = video.videoWidth * scale;
         canvas.height = video.videoHeight * scale;
 
@@ -175,10 +173,7 @@ const App = () => {
             // Ensure we capture near the end if we missed it by a large margin
             const lastFrameTime = frames.length > 0 ? frames[frames.length - 1].timestamp : -1;
             if (duration - lastFrameTime > interval * 1.5) {
-                // One final seek to the end
-                 video.currentTime = duration - 0.1; // Just before end
-                 // Note: logic flow here is tricky with async loop, 
-                 // simplifying: just finish. The "Analyze" prompt handles missing seconds well.
+                 video.currentTime = duration - 0.1; 
             }
              
             URL.revokeObjectURL(video.src);
@@ -195,7 +190,8 @@ const App = () => {
              frames.push({
                timestamp: currentTime,
                timeString: formatTime(currentTime),
-               dataUrl: canvas.toDataURL('image/jpeg', 0.6)
+               // Optimization: Reduced quality from 0.6 to 0.4 to prevent browser crash with 500 images
+               dataUrl: canvas.toDataURL('image/jpeg', 0.4)
              });
           }
           
@@ -278,6 +274,7 @@ const App = () => {
       4. A confidence level (High/Medium/Low).
       
       Ensure you analyze the ENTIRE duration of the video frames provided.
+      Strictly follow the JSON schema.
     ` });
 
     // Use Gemini 2.5/3 model
@@ -289,7 +286,7 @@ const App = () => {
       config: {
         responseMimeType: "application/json",
         maxOutputTokens: 8192, 
-        // Simplified schema: Removed 'reason' to prevent unescaped string syntax errors in the JSON response
+        // Simplified schema
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -303,7 +300,6 @@ const App = () => {
                   pdfId: { type: Type.INTEGER, description: "1 for PDF 1, 2 for PDF 2" },
                   pageNumber: { type: Type.INTEGER },
                   confidence: { type: Type.STRING },
-                  // reason field removed to improve JSON stability
                 }
               }
             }
@@ -318,23 +314,81 @@ const App = () => {
     }
 
     try {
-      // Robust JSON Extraction
-      // 1. Locate the outer JSON object braces to ignore any preamble/postamble text
-      const firstBrace = responseText.indexOf('{');
-      const lastBrace = responseText.lastIndexOf('}');
-      
+      // Robust JSON Extraction & Repair
       let cleanText = responseText;
+
+      // 1. Remove Markdown code blocks
+      cleanText = cleanText.replace(/```json/g, '').replace(/```/g, '');
+
+      // 2. Remove JS-style comments which invalidates JSON
+      // Caution: This might break URLs (http://), but our schema doesn't use URLs in output values.
+      cleanText = cleanText.replace(/\/\/.*$/gm, ''); 
+      cleanText = cleanText.replace(/\/\*[\s\S]*?\*\//g, '');
+
+      // 3. Locate the outer JSON object braces
+      const firstBrace = cleanText.indexOf('{');
+      // Use lastIndexOf to find the end, handling potential preamble/postamble
+      const lastBrace = cleanText.lastIndexOf('}');
+      
       if (firstBrace !== -1 && lastBrace !== -1) {
-        cleanText = responseText.substring(firstBrace, lastBrace + 1);
+        cleanText = cleanText.substring(firstBrace, lastBrace + 1);
+      } else if (firstBrace !== -1) {
+        // If truncated, take from start
+        cleanText = cleanText.substring(firstBrace);
       }
       
-      // 2. Parse JSON
+      // 4. Fix missing commas between array objects (Common LLM error: } { -> }, {)
+      cleanText = cleanText.replace(/}\s*{/g, '}, {');
+      
+      // 5. Balance Brackets (Handle truncated responses)
+      const openBrackets = (cleanText.match(/\[/g) || []).length;
+      const closeBrackets = (cleanText.match(/\]/g) || []).length;
+      const openBraces = (cleanText.match(/{/g) || []).length;
+      const closeBraces = (cleanText.match(/}/g) || []).length;
+
+      if (closeBrackets < openBrackets) {
+        cleanText += ']'.repeat(openBrackets - closeBrackets);
+      }
+      if (closeBraces < openBraces) {
+        cleanText += '}'.repeat(openBraces - closeBraces);
+      }
+
+      // 6. Parse JSON
       const json = JSON.parse(cleanText);
-      return json.transitions || [];
+      const rawTransitions = json.transitions || [];
+
+      // --- Midpoint Correction Algorithm ---
+      // Since we sample frames at an interval, the "detected" time is always late (the frame AFTER the change).
+      // We correct this by shifting the timestamp back by half the sampling interval.
+      // correctedTime = detectedTime - (avgInterval / 2)
+      
+      let avgInterval = 0;
+      if (videoFrms.length > 1) {
+         // Calculate actual interval from sampled frames
+         avgInterval = videoFrms[1].timestamp - videoFrms[0].timestamp;
+      } else if (videoFrms.length === 1) {
+         avgInterval = 0; 
+      }
+
+      const correctionFactor = avgInterval / 2;
+
+      const correctedTransitions = rawTransitions.map((t: any) => {
+          let correctedSeconds = t.seconds - correctionFactor;
+          if (correctedSeconds < 0) correctedSeconds = 0;
+          
+          return {
+            ...t,
+            seconds: correctedSeconds,
+            timestamp: formatTime(correctedSeconds)
+          };
+      });
+
+      return correctedTransitions;
+
     } catch (e) {
       console.error("JSON Parsing Error:", e);
       console.log("Raw Model Output:", responseText);
-      throw new Error("Failed to parse the analysis results. The model response was malformed.");
+      throw new Error("Failed to parse the analysis results. The model response was malformed. Please try again.");
     }
   };
 
