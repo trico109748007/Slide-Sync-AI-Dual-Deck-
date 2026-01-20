@@ -10,7 +10,7 @@ interface SlideMatch {
   seconds: number;
   pdfId: number; // 1 or 2
   pageNumber: number;
-  confidence: string;
+  confidence?: string; // Made optional to prevent crashes if model omits it
   reason?: string;
 }
 
@@ -38,6 +38,19 @@ const formatTime = (seconds: number): string => {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
+
+const parseTimeToSeconds = (timeStr: string): number => {
+  if (!timeStr) return 0;
+  // Handle MM:SS or HH:MM:SS
+  const parts = timeStr.split(':').map(part => parseInt(part.trim(), 10));
+  
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  } else if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return 0;
 };
 
 // --- Components ---
@@ -77,10 +90,9 @@ const App = () => {
       setPdfImages(allPdfImages);
       
       // 3. Process Video
-      setStatus({ step: 'extracting_video', message: 'Smart sampling video frames (High Density)...', progress: 25 });
+      setStatus({ step: 'extracting_video', message: 'Optimized Video Sampling (500 frames)...', progress: 25 });
       
-      // We no longer pass a fixed interval. The function calculates it based on video length
-      // to ensure we don't exceed token limits.
+      // We no longer pass a fixed interval. The function calculates it based on video length.
       const extractedVideoFrames = await extractVideoFrames(videoFile, (progress) => {
          // Map 0-100 to 25-65 total progress
          setStatus(prev => ({ ...prev, progress: 25 + (progress * 0.4) })); 
@@ -88,7 +100,7 @@ const App = () => {
       setVideoFrames(extractedVideoFrames);
 
       // 4. Analyze with Gemini
-      setStatus({ step: 'analyzing', message: 'Asking Gemini to match slides sequentially...', progress: 70 });
+      setStatus({ step: 'analyzing', message: 'Analyzing frame-by-frame (Gemini 2.5 Pro)...', progress: 70 });
       const analysisResults = await analyzeWithGemini(allPdfImages, extractedVideoFrames);
       
       setResults(analysisResults);
@@ -103,7 +115,11 @@ const App = () => {
   const extractPdfImages = async (file: File, pdfId: number): Promise<PdfPageImage[]> => {
     const arrayBuffer = await file.arrayBuffer();
     // @ts-ignore - pdfjsLib is loaded globally in index.html
-    const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const pdf = await window.pdfjsLib.getDocument({ 
+      data: arrayBuffer,
+      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+      cMapPacked: true,
+    }).promise;
     
     const images: PdfPageImage[] = [];
     const totalPages = pdf.numPages;
@@ -112,8 +128,8 @@ const App = () => {
       const page = await pdf.getPage(i);
       const viewport = page.getViewport({ scale: 1.0 });
       
-      // Scale down: max width 768px (Standard readable resolution, efficient for tokens)
-      const scale = Math.min(1.0, 768 / viewport.width);
+      // Scale down: max width 512px (Reduced from 768px to save tokens)
+      const scale = Math.min(1.0, 512 / viewport.width);
       const scaledViewport = page.getViewport({ scale });
 
       const canvas = document.createElement('canvas');
@@ -152,19 +168,18 @@ const App = () => {
            return;
         }
 
-        // --- Dynamic Interval Calculation ---
-        // Optimization: Increased target count to 500 for better accuracy
-        // while reducing image resolution and quality to keep payload small.
+        // --- Sampling Strategy ---
+        // Set to 500 frames as requested.
         const TARGET_FRAME_COUNT = 500; 
-        const MIN_INTERVAL = 2; // seconds
+        const MIN_INTERVAL = 1; // seconds
         
         let interval = duration / TARGET_FRAME_COUNT;
         if (interval < MIN_INTERVAL) interval = MIN_INTERVAL;
 
         let currentTime = 0;
         
-        // Optimization: Reduced max width from 512 to 400 to save tokens/bandwidth
-        const scale = Math.min(1.0, 400 / video.videoWidth);
+        // Optimization: Reduced max width from 400 to 256 (Thumbnail size) to prevent crash
+        const scale = Math.min(1.0, 256 / video.videoWidth);
         canvas.width = video.videoWidth * scale;
         canvas.height = video.videoHeight * scale;
 
@@ -190,8 +205,8 @@ const App = () => {
              frames.push({
                timestamp: currentTime,
                timeString: formatTime(currentTime),
-               // Optimization: Reduced quality from 0.6 to 0.4 to prevent browser crash with 500 images
-               dataUrl: canvas.toDataURL('image/jpeg', 0.4)
+               // Optimization: Low quality JPEG (0.3) for high volume data transmission
+               dataUrl: canvas.toDataURL('image/jpeg', 0.3)
              });
           }
           
@@ -277,8 +292,8 @@ const App = () => {
       Strictly follow the JSON schema.
     ` });
 
-    // Use Gemini 2.5/3 model
-    const modelId = "gemini-3-flash-preview"; 
+    // Use Gemini 2.5 Pro as requested
+    const modelId = "gemini-2.5-pro"; 
 
     const response = await ai.models.generateContent({
       model: modelId,
@@ -286,7 +301,7 @@ const App = () => {
       config: {
         responseMimeType: "application/json",
         maxOutputTokens: 8192, 
-        // Simplified schema
+        // Simplified schema: Removed 'seconds' to avoid calculation errors by the LLM
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -296,7 +311,6 @@ const App = () => {
                 type: Type.OBJECT,
                 properties: {
                   timestamp: { type: Type.STRING, description: "Time format MM:SS" },
-                  seconds: { type: Type.NUMBER, description: "Time in seconds" },
                   pdfId: { type: Type.INTEGER, description: "1 for PDF 1, 2 for PDF 2" },
                   pageNumber: { type: Type.INTEGER },
                   confidence: { type: Type.STRING },
@@ -321,20 +335,13 @@ const App = () => {
       cleanText = cleanText.replace(/```json/g, '').replace(/```/g, '');
 
       // 2. Remove JS-style comments which invalidates JSON
-      // Caution: This might break URLs (http://), but our schema doesn't use URLs in output values.
       cleanText = cleanText.replace(/\/\/.*$/gm, ''); 
       cleanText = cleanText.replace(/\/\*[\s\S]*?\*\//g, '');
 
-      // 3. Locate the outer JSON object braces
-      const firstBrace = cleanText.indexOf('{');
-      // Use lastIndexOf to find the end, handling potential preamble/postamble
-      const lastBrace = cleanText.lastIndexOf('}');
-      
-      if (firstBrace !== -1 && lastBrace !== -1) {
-        cleanText = cleanText.substring(firstBrace, lastBrace + 1);
-      } else if (firstBrace !== -1) {
-        // If truncated, take from start
-        cleanText = cleanText.substring(firstBrace);
+      // 3. Locate the outer JSON object braces using Regex for robust extraction
+      const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanText = jsonMatch[0];
       }
       
       // 4. Fix missing commas between array objects (Common LLM error: } { -> }, {)
@@ -373,7 +380,10 @@ const App = () => {
       const correctionFactor = avgInterval / 2;
 
       const correctedTransitions = rawTransitions.map((t: any) => {
-          let correctedSeconds = t.seconds - correctionFactor;
+          // Manually parse timestamp to seconds since we removed 'seconds' from schema
+          const detectedSeconds = parseTimeToSeconds(t.timestamp);
+          
+          let correctedSeconds = detectedSeconds - correctionFactor;
           if (correctedSeconds < 0) correctedSeconds = 0;
           
           return {
@@ -635,11 +645,11 @@ const App = () => {
                             <td className="p-4">
                               <span className={`
                                 px-2 py-1 rounded-full text-xs font-medium border
-                                ${match.confidence.toLowerCase() === 'high' 
+                                ${(match.confidence || 'low').toLowerCase() === 'high' 
                                   ? 'bg-green-500/10 text-green-400 border-green-500/20' 
                                   : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'}
                               `}>
-                                {match.confidence}
+                                {match.confidence || 'N/A'}
                               </span>
                             </td>
                           </tr>
