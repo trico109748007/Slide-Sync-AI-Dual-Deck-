@@ -1,0 +1,607 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { createRoot } from 'react-dom/client';
+import { GoogleGenAI, Type } from "@google/genai";
+import { Upload, FileVideo, FileText, Play, Loader2, CheckCircle, AlertCircle, Clock, Image as ImageIcon, ArrowDown } from 'lucide-react';
+
+// --- Types ---
+
+interface SlideMatch {
+  timestamp: string;
+  seconds: number;
+  pdfId: number; // 1 or 2
+  pageNumber: number;
+  confidence: string;
+  reason?: string;
+}
+
+interface ProcessingStatus {
+  step: 'idle' | 'extracting_pdf1' | 'extracting_pdf2' | 'extracting_video' | 'analyzing' | 'done' | 'error';
+  message: string;
+  progress: number; // 0 to 100
+}
+
+interface PdfPageImage {
+  pdfId: number;
+  pageNumber: number;
+  dataUrl: string; // base64
+}
+
+interface VideoFrameImage {
+  timestamp: number;
+  timeString: string;
+  dataUrl: string; // base64
+}
+
+// --- Helper Functions ---
+
+const formatTime = (seconds: number): string => {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
+
+// --- Components ---
+
+const App = () => {
+  const [apiKey, setApiKey] = useState(process.env.API_KEY || '');
+  
+  // File States
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [pdfFile1, setPdfFile1] = useState<File | null>(null);
+  const [pdfFile2, setPdfFile2] = useState<File | null>(null);
+  
+  // Data States
+  const [pdfImages, setPdfImages] = useState<PdfPageImage[]>([]);
+  const [videoFrames, setVideoFrames] = useState<VideoFrameImage[]>([]);
+  const [results, setResults] = useState<SlideMatch[]>([]);
+  
+  // Status State
+  const [status, setStatus] = useState<ProcessingStatus>({ step: 'idle', message: '', progress: 0 });
+
+  const processFiles = async () => {
+    if (!videoFile || !pdfFile1 || !pdfFile2 || !apiKey) return;
+
+    try {
+      const allPdfImages: PdfPageImage[] = [];
+
+      // 1. Process PDF 1
+      setStatus({ step: 'extracting_pdf1', message: 'Processing PDF 1 (First Presentation)...', progress: 5 });
+      const images1 = await extractPdfImages(pdfFile1, 1);
+      allPdfImages.push(...images1);
+      
+      // 2. Process PDF 2
+      setStatus({ step: 'extracting_pdf2', message: 'Processing PDF 2 (Second Presentation)...', progress: 15 });
+      const images2 = await extractPdfImages(pdfFile2, 2);
+      allPdfImages.push(...images2);
+
+      setPdfImages(allPdfImages);
+      
+      // 3. Process Video
+      setStatus({ step: 'extracting_video', message: 'Smart sampling video frames...', progress: 25 });
+      
+      // We no longer pass a fixed interval. The function calculates it based on video length
+      // to ensure we don't exceed token limits.
+      const extractedVideoFrames = await extractVideoFrames(videoFile, (progress) => {
+         // Map 0-100 to 25-65 total progress
+         setStatus(prev => ({ ...prev, progress: 25 + (progress * 0.4) })); 
+      });
+      setVideoFrames(extractedVideoFrames);
+
+      // 4. Analyze with Gemini
+      setStatus({ step: 'analyzing', message: 'Asking Gemini to match slides sequentially...', progress: 70 });
+      const analysisResults = await analyzeWithGemini(allPdfImages, extractedVideoFrames);
+      
+      setResults(analysisResults);
+      setStatus({ step: 'done', message: 'Analysis Complete!', progress: 100 });
+
+    } catch (error: any) {
+      console.error(error);
+      setStatus({ step: 'error', message: error.message || 'An error occurred', progress: 0 });
+    }
+  };
+
+  const extractPdfImages = async (file: File, pdfId: number): Promise<PdfPageImage[]> => {
+    const arrayBuffer = await file.arrayBuffer();
+    // @ts-ignore - pdfjsLib is loaded globally in index.html
+    const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    
+    const images: PdfPageImage[] = [];
+    const totalPages = pdf.numPages;
+
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 1.0 });
+      
+      // Scale down: max width 768px (Standard readable resolution, efficient for tokens)
+      const scale = Math.min(1.0, 768 / viewport.width);
+      const scaledViewport = page.getViewport({ scale });
+
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.height = scaledViewport.height;
+      canvas.width = scaledViewport.width;
+
+      if (context) {
+        await page.render({ canvasContext: context, viewport: scaledViewport }).promise;
+        images.push({
+          pdfId: pdfId,
+          pageNumber: i,
+          dataUrl: canvas.toDataURL('image/jpeg', 0.7) // Slightly reduced quality for token efficiency
+        });
+      }
+    }
+    return images;
+  };
+
+  const extractVideoFrames = async (file: File, onProgress: (p: number) => void): Promise<VideoFrameImage[]> => {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement('video');
+      video.src = URL.createObjectURL(file);
+      video.muted = true;
+      video.playsInline = true;
+
+      const frames: VideoFrameImage[] = [];
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      video.onloadedmetadata = async () => {
+        const duration = video.duration;
+        
+        if (!Number.isFinite(duration)) {
+           reject(new Error("Cannot determine video duration."));
+           return;
+        }
+
+        // --- Dynamic Interval Calculation ---
+        // Constraint: Avoid hitting 1M token limit.
+        // Target: ~250 frames max. 
+        // Logic: interval = duration / 250, but never less than 2 seconds to avoid redundancy in short videos.
+        const TARGET_FRAME_COUNT = 250; 
+        const MIN_INTERVAL = 2; // seconds
+        
+        let interval = duration / TARGET_FRAME_COUNT;
+        if (interval < MIN_INTERVAL) interval = MIN_INTERVAL;
+
+        let currentTime = 0;
+        
+        // Use a smaller size for video frames to allow more frames in context window
+        // Max width 512px, Quality 0.6
+        const scale = Math.min(1.0, 512 / video.videoWidth);
+        canvas.width = video.videoWidth * scale;
+        canvas.height = video.videoHeight * scale;
+
+        const processFrame = async () => {
+          if (currentTime > duration) {
+            // Ensure we capture near the end if we missed it by a large margin
+            const lastFrameTime = frames.length > 0 ? frames[frames.length - 1].timestamp : -1;
+            if (duration - lastFrameTime > interval * 1.5) {
+                // One final seek to the end
+                 video.currentTime = duration - 0.1; // Just before end
+                 // Note: logic flow here is tricky with async loop, 
+                 // simplifying: just finish. The "Analyze" prompt handles missing seconds well.
+            }
+             
+            URL.revokeObjectURL(video.src);
+            resolve(frames);
+            return;
+          }
+
+          video.currentTime = currentTime;
+        };
+
+        video.onseeked = () => {
+          if (ctx) {
+             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+             frames.push({
+               timestamp: currentTime,
+               timeString: formatTime(currentTime),
+               dataUrl: canvas.toDataURL('image/jpeg', 0.6)
+             });
+          }
+          
+          onProgress((currentTime / duration) * 100);
+          currentTime += interval;
+          processFrame();
+        };
+        
+        video.onerror = (e) => reject(new Error("Video playback error"));
+        
+        // Start processing
+        processFrame();
+      };
+
+      video.onerror = (e) => reject(new Error("Failed to load video"));
+    });
+  };
+
+  const analyzeWithGemini = async (pdfImgs: PdfPageImage[], videoFrms: VideoFrameImage[]): Promise<SlideMatch[]> => {
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const parts: any[] = [];
+    
+    // Split images by PDF ID for clarity in prompt
+    const pdf1Images = pdfImgs.filter(img => img.pdfId === 1);
+    const pdf2Images = pdfImgs.filter(img => img.pdfId === 2);
+
+    parts.push({ text: "Here are the reference slides from the FIRST PDF Presentation (PDF 1). This content appears first in the video:" });
+    
+    pdf1Images.forEach(img => {
+      parts.push({ text: `PDF 1 - Page ${img.pageNumber}` });
+      parts.push({
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: img.dataUrl.split(',')[1]
+        }
+      });
+    });
+
+    parts.push({ text: "\n\nHere are the reference slides from the SECOND PDF Presentation (PDF 2). This content appears AFTER PDF 1 in the video:" });
+
+    pdf2Images.forEach(img => {
+      parts.push({ text: `PDF 2 - Page ${img.pageNumber}` });
+      parts.push({
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: img.dataUrl.split(',')[1]
+        }
+      });
+    });
+
+    parts.push({ text: `\n\nHere are the frames extracted from the video (Sampled uniformly across duration):` });
+
+    videoFrms.forEach(frm => {
+      parts.push({ text: `Video Timestamp: ${frm.timeString}` });
+      parts.push({
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: frm.dataUrl.split(',')[1]
+        }
+      });
+    });
+
+    parts.push({ text: `
+      Analyze the video frames and determine which PDF page is currently visible in each frame.
+      
+      Important Context:
+      - The video is a continuous recording of two presentations.
+      - First, the speaker presents slides from PDF 1.
+      - Then, the speaker switches to presenting slides from PDF 2.
+      - A transition from PDF 1 to PDF 2 should happen exactly once.
+      
+      Output a list of "Transition Events". A transition event occurs when the slide changes.
+      Include the very first slide at the beginning (Timestamp 00:00).
+      
+      For each transition, provide:
+      1. The timestamp (MM:SS) where this slide FIRST appears.
+      2. The ID of the PDF (1 or 2).
+      3. The PDF Page Number.
+      4. A confidence level (High/Medium/Low).
+      
+      Ensure you analyze the ENTIRE duration of the video frames provided.
+    ` });
+
+    // Use Gemini 2.5/3 model
+    const modelId = "gemini-3-flash-preview"; 
+
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: { parts },
+      config: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 8192, 
+        // Simplified schema: Removed 'reason' to prevent unescaped string syntax errors in the JSON response
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            transitions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  timestamp: { type: Type.STRING, description: "Time format MM:SS" },
+                  seconds: { type: Type.NUMBER, description: "Time in seconds" },
+                  pdfId: { type: Type.INTEGER, description: "1 for PDF 1, 2 for PDF 2" },
+                  pageNumber: { type: Type.INTEGER },
+                  confidence: { type: Type.STRING },
+                  // reason field removed to improve JSON stability
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const responseText = response.text;
+    if (!responseText) {
+      throw new Error("The model returned an empty response. This might be due to content safety filters.");
+    }
+
+    try {
+      // Robust JSON Extraction
+      // 1. Locate the outer JSON object braces to ignore any preamble/postamble text
+      const firstBrace = responseText.indexOf('{');
+      const lastBrace = responseText.lastIndexOf('}');
+      
+      let cleanText = responseText;
+      if (firstBrace !== -1 && lastBrace !== -1) {
+        cleanText = responseText.substring(firstBrace, lastBrace + 1);
+      }
+      
+      // 2. Parse JSON
+      const json = JSON.parse(cleanText);
+      return json.transitions || [];
+    } catch (e) {
+      console.error("JSON Parsing Error:", e);
+      console.log("Raw Model Output:", responseText);
+      throw new Error("Failed to parse the analysis results. The model response was malformed.");
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-8">
+      <div className="max-w-6xl mx-auto space-y-8">
+        
+        {/* Header */}
+        <div className="flex items-center space-x-3 border-b border-slate-800 pb-6">
+          <div className="bg-blue-600 p-2 rounded-lg">
+            <Play className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400">
+              Slide Sync AI (Dual Deck)
+            </h1>
+            <p className="text-slate-400 text-sm">
+              Sync video timelines with two sequential PDF presentations (Part 1 &rarr; Part 2).
+            </p>
+          </div>
+        </div>
+
+        {/* Input Section */}
+        {status.step === 'idle' || status.step === 'error' ? (
+          <div className="grid md:grid-cols-2 gap-6 h-full">
+            
+            {/* Left Column: Video Input (Full Height) */}
+            <div className={`
+              h-full min-h-[400px] border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center space-y-4 transition-colors
+              ${videoFile ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-900'}
+            `}>
+              <div className="bg-slate-800 p-4 rounded-full">
+                <FileVideo className="w-10 h-10 text-blue-400" />
+              </div>
+              <div className="text-center">
+                <p className="font-medium text-xl">
+                  {videoFile ? videoFile.name : "Upload Full Video"}
+                </p>
+                <p className="text-slate-400 text-sm mt-1">
+                   {videoFile ? `${(videoFile.size / 1024 / 1024).toFixed(2)} MB` : "MP4, MOV, WebM"}
+                </p>
+              </div>
+              <label className="cursor-pointer">
+                <input 
+                  type="file" 
+                  accept="video/*" 
+                  className="hidden" 
+                  onChange={(e) => setVideoFile(e.target.files?.[0] || null)} 
+                />
+                <span className="px-6 py-3 bg-slate-800 hover:bg-slate-700 rounded-md font-medium transition-colors">
+                  {videoFile ? "Change Video" : "Select Video File"}
+                </span>
+              </label>
+            </div>
+
+            {/* Right Column: 2 PDF Inputs (Stacked) */}
+            <div className="flex flex-col space-y-6">
+              
+              {/* PDF 1 Input */}
+              <div className={`
+                flex-1 border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center space-y-3 transition-colors relative
+                ${pdfFile1 ? 'border-red-500 bg-red-500/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-900'}
+              `}>
+                <div className="absolute top-4 left-4 bg-slate-800 px-2 py-1 rounded text-xs font-bold text-slate-300 uppercase">
+                  Part 1
+                </div>
+                <div className="bg-slate-800 p-3 rounded-full">
+                  <FileText className="w-6 h-6 text-red-400" />
+                </div>
+                <div className="text-center">
+                  <p className="font-medium text-lg">
+                    {pdfFile1 ? pdfFile1.name : "Upload PDF 1"}
+                  </p>
+                  <p className="text-slate-400 text-xs">
+                    Starts at the beginning
+                  </p>
+                </div>
+                <label className="cursor-pointer">
+                  <input 
+                    type="file" 
+                    accept="application/pdf" 
+                    className="hidden" 
+                    onChange={(e) => setPdfFile1(e.target.files?.[0] || null)} 
+                  />
+                  <span className="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-md text-sm font-medium transition-colors">
+                    {pdfFile1 ? "Change PDF 1" : "Select PDF 1"}
+                  </span>
+                </label>
+              </div>
+
+              {/* Arrow Indicator */}
+              <div className="flex justify-center -my-3 z-10">
+                 <ArrowDown className="w-6 h-6 text-slate-600" />
+              </div>
+
+              {/* PDF 2 Input */}
+              <div className={`
+                flex-1 border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center space-y-3 transition-colors relative
+                ${pdfFile2 ? 'border-orange-500 bg-orange-500/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-900'}
+              `}>
+                 <div className="absolute top-4 left-4 bg-slate-800 px-2 py-1 rounded text-xs font-bold text-slate-300 uppercase">
+                  Part 2
+                </div>
+                <div className="bg-slate-800 p-3 rounded-full">
+                  <FileText className="w-6 h-6 text-orange-400" />
+                </div>
+                <div className="text-center">
+                  <p className="font-medium text-lg">
+                    {pdfFile2 ? pdfFile2.name : "Upload PDF 2"}
+                  </p>
+                  <p className="text-slate-400 text-xs">
+                    Follows PDF 1
+                  </p>
+                </div>
+                <label className="cursor-pointer">
+                  <input 
+                    type="file" 
+                    accept="application/pdf" 
+                    className="hidden" 
+                    onChange={(e) => setPdfFile2(e.target.files?.[0] || null)} 
+                  />
+                  <span className="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-md text-sm font-medium transition-colors">
+                    {pdfFile2 ? "Change PDF 2" : "Select PDF 2"}
+                  </span>
+                </label>
+              </div>
+
+            </div>
+
+            {/* Analyze Button */}
+            <div className="md:col-span-2 flex justify-center pt-4">
+              <button
+                disabled={!videoFile || !pdfFile1 || !pdfFile2}
+                onClick={processFiles}
+                className={`
+                  flex items-center space-x-2 px-8 py-4 rounded-lg text-lg font-bold transition-all w-full md:w-auto justify-center
+                  ${!videoFile || !pdfFile1 || !pdfFile2
+                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed' 
+                    : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/50 scale-100 hover:scale-105 active:scale-95'}
+                `}
+              >
+                <Play className="w-6 h-6 fill-current" />
+                <span>Start Dual-Deck Synchronization</span>
+              </button>
+            </div>
+            
+            {status.step === 'error' && (
+               <div className="md:col-span-2 bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-lg flex items-center space-x-3">
+                 <AlertCircle className="w-5 h-5" />
+                 <span>{status.message}</span>
+               </div>
+            )}
+
+          </div>
+        ) : (
+          // Processing & Results View
+          <div className="space-y-8 animate-in fade-in duration-500">
+            
+            {/* Progress Bar */}
+            {status.step !== 'done' && (
+              <div className="bg-slate-900 rounded-xl p-8 border border-slate-800 text-center space-y-4">
+                <div className="relative w-16 h-16 mx-auto">
+                   <Loader2 className="w-16 h-16 text-blue-500 animate-spin" />
+                </div>
+                <h2 className="text-xl font-medium">{status.message}</h2>
+                <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                  <div 
+                    className="bg-blue-500 h-full transition-all duration-300 ease-out" 
+                    style={{ width: `${status.progress}%` }}
+                  ></div>
+                </div>
+              </div>
+            )}
+
+            {/* Results Table */}
+            {results.length > 0 && (
+              <div className="bg-slate-900 rounded-xl border border-slate-800 overflow-hidden">
+                <div className="p-6 border-b border-slate-800 flex justify-between items-center">
+                  <h2 className="text-xl font-bold flex items-center space-x-2">
+                    <CheckCircle className="w-5 h-5 text-green-500" />
+                    <span>Analysis Results</span>
+                  </h2>
+                  <button 
+                    onClick={() => {
+                        setResults([]);
+                        setStatus({ step: 'idle', message: '', progress: 0 });
+                    }}
+                    className="text-slate-400 hover:text-white text-sm"
+                  >
+                    Start Over
+                  </button>
+                </div>
+                
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-800/50 text-slate-400 text-sm uppercase tracking-wider">
+                        <th className="p-4 w-32">Time</th>
+                        <th className="p-4 w-24 text-center">Source</th>
+                        <th className="p-4 w-24 text-center">Page</th>
+                        <th className="p-4">Slide Preview</th>
+                        <th className="p-4 w-32">Confidence</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800">
+                      {results.map((match, idx) => {
+                        // Find the PDF image for preview
+                        const pdfImg = pdfImages.find(p => p.pageNumber === match.pageNumber && p.pdfId === match.pdfId);
+                        
+                        return (
+                          <tr key={idx} className="hover:bg-slate-800/30 transition-colors group">
+                            <td className="p-4 font-mono text-lg font-medium text-blue-400 flex items-center space-x-2">
+                               <Clock className="w-4 h-4 text-slate-600" />
+                               <span>{match.timestamp}</span>
+                            </td>
+                             <td className="p-4 text-center">
+                               <div className={`inline-block px-2 py-1 rounded text-xs font-bold uppercase ${match.pdfId === 1 ? 'bg-red-500/20 text-red-400' : 'bg-orange-500/20 text-orange-400'}`}>
+                                 PDF {match.pdfId}
+                               </div>
+                            </td>
+                            <td className="p-4 text-center">
+                               <div className="inline-block bg-slate-800 rounded px-2 py-1 font-bold">
+                                 #{match.pageNumber}
+                               </div>
+                            </td>
+                            <td className="p-4">
+                               {pdfImg ? (
+                                 <div className="flex items-start space-x-4">
+                                   <img 
+                                     src={pdfImg.dataUrl} 
+                                     alt={`PDF ${match.pdfId} - Page ${match.pageNumber}`} 
+                                     className="h-24 rounded border border-slate-700 shadow-sm" 
+                                   />
+                                   {match.reason && (
+                                     <p className="text-sm text-slate-500 max-w-md hidden md:block italic">
+                                       "{match.reason}"
+                                     </p>
+                                   )}
+                                 </div>
+                               ) : (
+                                 <span className="text-slate-600 italic">No preview</span>
+                               )}
+                            </td>
+                            <td className="p-4">
+                              <span className={`
+                                px-2 py-1 rounded-full text-xs font-medium border
+                                ${match.confidence.toLowerCase() === 'high' 
+                                  ? 'bg-green-500/10 text-green-400 border-green-500/20' 
+                                  : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'}
+                              `}>
+                                {match.confidence}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const root = createRoot(document.getElementById('root')!);
+root.render(<App />);
