@@ -78,19 +78,19 @@ const App = () => {
       const allPdfImages: PdfPageImage[] = [];
 
       // 1. Process PDF 1
-      setStatus({ step: 'extracting_pdf1', message: 'Processing PDF 1 (First Presentation)...', progress: 5 });
+      setStatus({ step: 'extracting_pdf1', message: '正在處理 PDF 1 (第一份簡報)...', progress: 5 });
       const images1 = await extractPdfImages(pdfFile1, 1);
       allPdfImages.push(...images1);
       
       // 2. Process PDF 2
-      setStatus({ step: 'extracting_pdf2', message: 'Processing PDF 2 (Second Presentation)...', progress: 15 });
+      setStatus({ step: 'extracting_pdf2', message: '正在處理 PDF 2 (第二份簡報)...', progress: 15 });
       const images2 = await extractPdfImages(pdfFile2, 2);
       allPdfImages.push(...images2);
 
       setPdfImages(allPdfImages);
       
       // 3. Process Video
-      setStatus({ step: 'extracting_video', message: 'Optimized Video Sampling (500 frames)...', progress: 25 });
+      setStatus({ step: 'extracting_video', message: '正在進行最佳化影片取樣 (500 幀)...', progress: 25 });
       
       // We no longer pass a fixed interval. The function calculates it based on video length.
       const extractedVideoFrames = await extractVideoFrames(videoFile, (progress) => {
@@ -100,15 +100,15 @@ const App = () => {
       setVideoFrames(extractedVideoFrames);
 
       // 4. Analyze with Gemini
-      setStatus({ step: 'analyzing', message: 'Analyzing frame-by-frame (Gemini 2.5 Pro)...', progress: 70 });
+      setStatus({ step: 'analyzing', message: '正在逐幀分析 (Gemini 2.5 Pro)...', progress: 70 });
       const analysisResults = await analyzeWithGemini(allPdfImages, extractedVideoFrames);
       
       setResults(analysisResults);
-      setStatus({ step: 'done', message: 'Analysis Complete!', progress: 100 });
+      setStatus({ step: 'done', message: '分析完成！', progress: 100 });
 
     } catch (error: any) {
       console.error(error);
-      setStatus({ step: 'error', message: error.message || 'An error occurred', progress: 0 });
+      setStatus({ step: 'error', message: error.message || '發生錯誤', progress: 0 });
     }
   };
 
@@ -164,7 +164,7 @@ const App = () => {
         const duration = video.duration;
         
         if (!Number.isFinite(duration)) {
-           reject(new Error("Cannot determine video duration."));
+           reject(new Error("無法確定影片長度。"));
            return;
         }
 
@@ -215,13 +215,13 @@ const App = () => {
           processFrame();
         };
         
-        video.onerror = (e) => reject(new Error("Video playback error"));
+        video.onerror = (e) => reject(new Error("影片播放錯誤"));
         
         // Start processing
         processFrame();
       };
 
-      video.onerror = (e) => reject(new Error("Failed to load video"));
+      video.onerror = (e) => reject(new Error("無法載入影片"));
     });
   };
 
@@ -324,7 +324,7 @@ const App = () => {
 
     const responseText = response.text;
     if (!responseText) {
-      throw new Error("The model returned an empty response. This might be due to content safety filters.");
+      throw new Error("模型回傳了空的回應。這可能是由於內容安全過濾器所致。");
     }
 
     try {
@@ -398,7 +398,7 @@ const App = () => {
     } catch (e) {
       console.error("JSON Parsing Error:", e);
       console.log("Raw Model Output:", responseText);
-      throw new Error("Failed to parse the analysis results. The model response was malformed. Please try again.");
+      throw new Error("無法解析分析結果。模型回應格式錯誤。請重試。");
     }
   };
 
@@ -413,10 +413,10 @@ const App = () => {
           </div>
           <div>
             <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400">
-              Slide Sync AI (Dual Deck)
+              簡報同步 AI (雙份簡報)
             </h1>
             <p className="text-slate-400 text-sm">
-              Sync video timelines with two sequential PDF presentations (Part 1 &rarr; Part 2).
+              將影片時間軸與兩份連續的 PDF 簡報（第一部分 &rarr; 第二部分）同步。
             </p>
           </div>
         </div>
@@ -435,7 +435,7 @@ const App = () => {
               </div>
               <div className="text-center">
                 <p className="font-medium text-xl">
-                  {videoFile ? videoFile.name : "Upload Full Video"}
+                  {videoFile ? videoFile.name : "上傳完整影片"}
                 </p>
                 <p className="text-slate-400 text-sm mt-1">
                    {videoFile ? `${(videoFile.size / 1024 / 1024).toFixed(2)} MB` : "MP4, MOV, WebM"}
@@ -449,7 +449,7 @@ const App = () => {
                   onChange={(e) => setVideoFile(e.target.files?.[0] || null)} 
                 />
                 <span className="px-6 py-3 bg-slate-800 hover:bg-slate-700 rounded-md font-medium transition-colors">
-                  {videoFile ? "Change Video" : "Select Video File"}
+                  {videoFile ? "更換影片" : "選擇影片檔案"}
                 </span>
               </label>
             </div>
@@ -463,17 +463,17 @@ const App = () => {
                 ${pdfFile1 ? 'border-red-500 bg-red-500/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-900'}
               `}>
                 <div className="absolute top-4 left-4 bg-slate-800 px-2 py-1 rounded text-xs font-bold text-slate-300 uppercase">
-                  Part 1
+                  第一部分
                 </div>
                 <div className="bg-slate-800 p-3 rounded-full">
                   <FileText className="w-6 h-6 text-red-400" />
                 </div>
                 <div className="text-center">
                   <p className="font-medium text-lg">
-                    {pdfFile1 ? pdfFile1.name : "Upload PDF 1"}
+                    {pdfFile1 ? pdfFile1.name : "上傳 PDF 1"}
                   </p>
                   <p className="text-slate-400 text-xs">
-                    Starts at the beginning
+                    從影片開頭開始
                   </p>
                 </div>
                 <label className="cursor-pointer">
@@ -484,7 +484,7 @@ const App = () => {
                     onChange={(e) => setPdfFile1(e.target.files?.[0] || null)} 
                   />
                   <span className="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-md text-sm font-medium transition-colors">
-                    {pdfFile1 ? "Change PDF 1" : "Select PDF 1"}
+                    {pdfFile1 ? "更換 PDF 1" : "選擇 PDF 1"}
                   </span>
                 </label>
               </div>
@@ -500,17 +500,17 @@ const App = () => {
                 ${pdfFile2 ? 'border-orange-500 bg-orange-500/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-900'}
               `}>
                  <div className="absolute top-4 left-4 bg-slate-800 px-2 py-1 rounded text-xs font-bold text-slate-300 uppercase">
-                  Part 2
+                  第二部分
                 </div>
                 <div className="bg-slate-800 p-3 rounded-full">
                   <FileText className="w-6 h-6 text-orange-400" />
                 </div>
                 <div className="text-center">
                   <p className="font-medium text-lg">
-                    {pdfFile2 ? pdfFile2.name : "Upload PDF 2"}
+                    {pdfFile2 ? pdfFile2.name : "上傳 PDF 2"}
                   </p>
                   <p className="text-slate-400 text-xs">
-                    Follows PDF 1
+                    接續在 PDF 1 之後
                   </p>
                 </div>
                 <label className="cursor-pointer">
@@ -521,7 +521,7 @@ const App = () => {
                     onChange={(e) => setPdfFile2(e.target.files?.[0] || null)} 
                   />
                   <span className="px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-md text-sm font-medium transition-colors">
-                    {pdfFile2 ? "Change PDF 2" : "Select PDF 2"}
+                    {pdfFile2 ? "更換 PDF 2" : "選擇 PDF 2"}
                   </span>
                 </label>
               </div>
@@ -541,7 +541,7 @@ const App = () => {
                 `}
               >
                 <Play className="w-6 h-6 fill-current" />
-                <span>Start Dual-Deck Synchronization</span>
+                <span>開始雙份簡報同步分析</span>
               </button>
             </div>
             
@@ -579,7 +579,7 @@ const App = () => {
                 <div className="p-6 border-b border-slate-800 flex justify-between items-center">
                   <h2 className="text-xl font-bold flex items-center space-x-2">
                     <CheckCircle className="w-5 h-5 text-green-500" />
-                    <span>Analysis Results</span>
+                    <span>分析結果</span>
                   </h2>
                   <button 
                     onClick={() => {
@@ -588,7 +588,7 @@ const App = () => {
                     }}
                     className="text-slate-400 hover:text-white text-sm"
                   >
-                    Start Over
+                    重新開始
                   </button>
                 </div>
                 
@@ -596,11 +596,11 @@ const App = () => {
                   <table className="w-full text-left border-collapse">
                     <thead>
                       <tr className="bg-slate-800/50 text-slate-400 text-sm uppercase tracking-wider">
-                        <th className="p-4 w-32">Time</th>
-                        <th className="p-4 w-24 text-center">Source</th>
-                        <th className="p-4 w-24 text-center">Page</th>
-                        <th className="p-4">Slide Preview</th>
-                        <th className="p-4 w-32">Confidence</th>
+                        <th className="p-4 w-32">時間</th>
+                        <th className="p-4 w-24 text-center">來源</th>
+                        <th className="p-4 w-24 text-center">頁碼</th>
+                        <th className="p-4">投影片預覽</th>
+                        <th className="p-4 w-32">信心指數</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
@@ -639,7 +639,7 @@ const App = () => {
                                    )}
                                  </div>
                                ) : (
-                                 <span className="text-slate-600 italic">No preview</span>
+                                 <span className="text-slate-600 italic">無預覽</span>
                                )}
                             </td>
                             <td className="p-4">
@@ -649,7 +649,7 @@ const App = () => {
                                   ? 'bg-green-500/10 text-green-400 border-green-500/20' 
                                   : 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'}
                               `}>
-                                {match.confidence || 'N/A'}
+                                {match.confidence || '未知'}
                               </span>
                             </td>
                           </tr>
