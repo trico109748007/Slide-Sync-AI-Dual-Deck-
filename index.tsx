@@ -90,7 +90,7 @@ const App = () => {
       setPdfImages(allPdfImages);
       
       // 3. Process Video
-      setStatus({ step: 'extracting_video', message: '正在進行最佳化影片取樣 (500 幀)...', progress: 25 });
+      setStatus({ step: 'extracting_video', message: '正在進行最佳化影片取樣 (600 幀)...', progress: 25 });
       
       // We no longer pass a fixed interval. The function calculates it based on video length.
       const extractedVideoFrames = await extractVideoFrames(videoFile, (progress) => {
@@ -169,8 +169,8 @@ const App = () => {
         }
 
         // --- Sampling Strategy ---
-        // Set to 500 frames as requested.
-        const TARGET_FRAME_COUNT = 500; 
+        // Set to 1500 frames as requested.
+        const TARGET_FRAME_COUNT = 600; 
         const MIN_INTERVAL = 1; // seconds
         
         let interval = duration / TARGET_FRAME_COUNT;
@@ -178,7 +178,7 @@ const App = () => {
 
         let currentTime = 0;
         
-        // Optimization: Reduced max width from 400 to 256 (Thumbnail size) to prevent crash
+        // Optimization: Reduced max width to 128 (Thumbnail size) to handle 1500 frames
         const scale = Math.min(1.0, 256 / video.videoWidth);
         canvas.width = video.videoWidth * scale;
         canvas.height = video.videoHeight * scale;
