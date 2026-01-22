@@ -292,8 +292,8 @@ const App = () => {
       Strictly follow the JSON schema.
     ` });
 
-    // Use Gemini 2.5 Pro as requested
-    const modelId = "gemini-2.5-pro"; 
+    // Use gemini-2.5-flash as requested
+    const modelId = "gemini-2.5-flash"; 
 
     const response = await ai.models.generateContent({
       model: modelId,
